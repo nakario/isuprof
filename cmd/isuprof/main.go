@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"go/ast"
 	"go/format"
@@ -8,8 +9,10 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"io/ioutil"
 	"log"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 
@@ -89,7 +92,10 @@ func newInfoResolver(pathToName map[string]string, pkg *types.Package) infoResol
 		if pkg == other || pathToName[other.Path()] == "." {
 			return ""
 		}
-		return pathToName[other.Path()]
+		if name, ok := pathToName[other.Path()]; ok {
+			return name
+		}
+		return other.Name()
 	})}
 }
 
@@ -98,7 +104,6 @@ func (ir infoResolver) resolveFuncInfo(typ types.Type) funcInfo {
 	if !ok {
 		log.Fatalln("Unexpected non-function")
 	}
-	fmt.Println("Signature:", sig)
 	params := sig.Params()
 	results := sig.Results()
 	fi := funcInfo{
@@ -122,15 +127,136 @@ func (ir infoResolver) resolveFuncInfo(typ types.Type) funcInfo {
 	return fi
 }
 
+func (ir infoResolver) generateWrapper(name string, t types.Type) string {
+	fi := ir.resolveFuncInfo(t)
+	newFunc := generator.NewFunc(
+		nil,
+		generator.NewFuncSignature(
+			name,
+		).AddParameters(
+			append(
+				[]*generator.FuncParameter{generator.NewFuncParameter("a", fi.orig.String())},
+				fi.funcParameters()...
+			)...
+		).AddReturnTypeStatements(fi.funcReturnTypes()...),
+		generator.NewRawStatement("pc := reflect.ValueOf(a).Pointer()"),
+		generator.NewRawStatement("name := runtime.FuncForPC(pc).Name()"),
+		generator.NewRawStatementf("ps := []interface{}{%s}", func() string {
+			length := len(fi.params)
+			if fi.variadic { length-- }
+			if length == 0 { return "" }
+			b := new(strings.Builder)
+			for i := 0; i < length; i++ {
+				if i > 0 {
+					fmt.Fprint(b, ", ")
+				}
+				fmt.Fprint(b, "p" + strconv.Itoa(i))
+			}
+			return b.String()
+		}()),
+		generator.NewRawStatement(func() string {
+			if !fi.variadic { return "" }
+			return "for i := 0; i < len(p" + strconv.Itoa(len(fi.params) - 1) + "); i++ { ps = append(ps, p" + strconv.Itoa(len(fi.params) - 1) + "[i]) }"
+		}()),
+		generator.NewRawStatement("p := _isuprofStartProfiling(name, ps...)"),
+		generator.NewRawStatementf("%sa(%s)", func() string {
+			if len(fi.results) == 0 { return "" }
+			b := new(strings.Builder)
+			for i := 0; i < len(fi.results); i++ {
+				if i > 0 {
+					fmt.Fprint(b, ", ")
+				}
+				fmt.Fprint(b, "r" + strconv.Itoa(i))
+			}
+			fmt.Fprint(b, " = ")
+			return b.String()
+		}(), func() string {
+			if len(fi.params) == 0 { return "" }
+			b := new(strings.Builder)
+			for i := 0; i < len(fi.params); i++ {
+				if i > 0 {
+					fmt.Fprint(b, ", ")
+				}
+				fmt.Fprint(b, "p" + strconv.Itoa(i))
+			}
+			if fi.variadic {
+				fmt.Fprint(b, "...")
+			}
+			return b.String()
+		}()),
+		generator.NewRawStatementf("p.stopProfiling(%s)", func() string {
+			if len(fi.results) == 0 { return "" }
+			b := new(strings.Builder)
+			for i := 0; i < len(fi.results); i++ {
+				if i > 0 {
+					fmt.Fprint(b, ", ")
+				}
+				fmt.Fprint(b, "r" + strconv.Itoa(i))
+			}
+			return b.String()
+		}()),
+		generator.NewRawStatement("return"),
+	)
+	generated, err := newFunc.Generate(0)
+	if err != nil {
+		log.Fatal("failed to generate a new func:", err)
+	}
+	return generated
+}
+
 func wrapperName(hash uint32) string {
 	return "_isuprofWrapper" + strconv.Itoa(int(hash))
 }
 
+type Hasher struct {
+	hasher typeutil.Hasher
+	forward map[types.Type]uint32
+	backward map[uint32]types.Type
+}
+
+func newHasher() Hasher {
+	return Hasher{
+		hasher: typeutil.MakeHasher(),
+		forward: make(map[types.Type]uint32),
+		backward: make(map[uint32]types.Type),
+	}
+}
+
+func (h Hasher) Hash(t types.Type) uint32 {
+	hash, ok := h.forward[t]
+	if !ok {
+		hash = h.hasher.Hash(t)
+		t2, exists := h.backward[hash]
+		i := 0
+		for exists {
+			if types.Identical(t, t2) {
+				h.forward[t] = hash
+				return hash
+			}
+			i++
+			if i > 10000 {
+				panic("too many hash collisions!")
+			}
+			hash++
+			t2, exists = h.backward[hash]
+		}
+		h.forward[t] = hash
+		h.backward[hash] = t
+	}
+	return hash
+}
+
 func main() {
+	dir := "/Users/nakao/workspace/isucon9q/isucon9q"
+
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, "example.go", src, parser.Mode(0))
+	pkgs, err := parser.ParseDir(fset, dir, nil, parser.Mode(0))
 	if err != nil {
-		log.Fatal("failed to parse file:", err)
+		log.Fatalf("failed to parse dir %s: %s", dir, err.Error())
+	}
+	files := make([]*ast.File, 0)
+	for _, f := range pkgs["main"].Files {
+		files = append(files, f)
 	}
 
 	conf := types.Config{Importer: importer.Default()}
@@ -142,7 +268,7 @@ func main() {
 		Selections: make(map[*ast.SelectorExpr]*types.Selection),
 		Scopes: make(map[ast.Node]*types.Scope),
 	}
-	pkg, err := conf.Check("path/to/pkg", fset, []*ast.File{f}, info)
+	pkg, err := conf.Check(dir, fset, files, info)
 	if err != nil {
 		log.Fatal("failed to type-check:", err)
 	}
@@ -171,98 +297,41 @@ func main() {
 		generator.NewNewline(),
 	)
 
-	hasher := typeutil.MakeHasher()
-	signatures := make(map[uint32][]string)
+	hasher := newHasher()
 	funcDecls := make(map[uint32]string)
 
-	n := astutil.Apply(f, func(cr *astutil.Cursor) bool {
-		if ce, ok := cr.Node().(*ast.CallExpr); ok {
-			tav, ok := info.Types[ce.Fun]
-			if !ok || !tav.IsValue() {
-				// type not found or expr is a type conversion or a builtin call
-				return true
-			}
-			hash := hasher.Hash(tav.Type)
-			if _, ok := signatures[hash]; !ok {
-				fi := resolver.resolveFuncInfo(tav.Type)
-				newFunc := generator.NewFunc(
-					nil,
-					generator.NewFuncSignature(
-						wrapperName(hash),
-					).AddParameters(
-						append(
-							[]*generator.FuncParameter{generator.NewFuncParameter("a", fi.orig.String())},
-							fi.funcParameters()...
-						)...
-					).AddReturnTypeStatements(fi.funcReturnTypes()...),
-					generator.NewRawStatement("pc := reflect.ValueOf(a).Pointer()"),
-					generator.NewRawStatement("name := runtime.FuncForPC(pc).Name()"),
-					generator.NewRawStatementf("p := _isuprofStartProfiling(name%s)", func() string {
-						if len(fi.params) == 0 { return "" }
-						b := new(strings.Builder)
-						for i := 0; i < len(fi.params); i++ {
-							fmt.Fprint(b, ", p" + strconv.Itoa(i))
-						}
-						if fi.variadic {
-							fmt.Fprint(b, "...")
-						}
-						return b.String()
-					}()),
-					generator.NewRawStatementf("%sa(%s)", func() string {
-						if len(fi.results) == 0 { return "" }
-						b := new(strings.Builder)
-						for i := 0; i < len(fi.results); i++ {
-							if i > 0 {
-								fmt.Fprint(b, ", ")
-							}
-							fmt.Fprint(b, "r" + strconv.Itoa(i))
-						}
-						fmt.Fprint(b, " = ")
-						return b.String()
-					}(), func() string {
-						if len(fi.results) == 0 { return "" }
-						b := new(strings.Builder)
-						for i := 0; i < len(fi.params); i++ {
-							if i > 0 {
-								fmt.Fprint(b, ", ")
-							}
-							fmt.Fprint(b, "p" + strconv.Itoa(i))
-						}
-						if fi.variadic {
-							fmt.Fprint(b, "...")
-						}
-						return b.String()
-					}()),
-					generator.NewRawStatementf("p.stopProfiling(%s)", func() string {
-						if len(fi.results) == 0 { return "" }
-						b := new(strings.Builder)
-						for i := 0; i < len(fi.results); i++ {
-							if i > 0 {
-								fmt.Fprint(b, ", ")
-							}
-							fmt.Fprint(b, "r" + strconv.Itoa(i))
-						}
-						return b.String()
-					}()),
-				)
-				generated, err := newFunc.Generate(0)
-				if err != nil {
-					log.Println("failed to generate a new func:", err)
+	for fname, f := range pkgs["main"].Files {
+		n := astutil.Apply(f, func(cr *astutil.Cursor) bool {
+			if ce, ok := cr.Node().(*ast.CallExpr); ok {
+				tav, ok := info.Types[ce.Fun]
+				if !ok || !tav.IsValue() {
+					// type not found or expr is a type conversion or a builtin call
 					return true
 				}
-				funcDecls[hash] = generated
+				hash := hasher.Hash(tav.Type)
+				if _, ok := funcDecls[hash]; !ok {
+					generated := resolver.generateWrapper(wrapperName(hash), tav.Type)
+					funcDecls[hash] = generated
+				}
+				cr.Replace(&ast.CallExpr{
+					Fun: &ast.Ident{
+						Name: wrapperName(hash),
+						Obj: ast.NewObj(ast.Fun, wrapperName(hash)),
+					},
+					Args: append([]ast.Expr{ce.Fun}, ce.Args...),
+				})
 			}
-			signatures[hash] = append(signatures[hash], types.ExprString((ce)))
-			cr.Replace(&ast.CallExpr{
-				Fun: &ast.Ident{
-					Name: wrapperName(hash),
-					Obj: ast.NewObj(ast.Fun, wrapperName(hash)),
-				},
-				Args: append([]ast.Expr{ce.Fun}, ce.Args...),
-			})
+			return true
+		}, nil)
+		buf := new(bytes.Buffer)
+		if err := format.Node(buf, token.NewFileSet(), n); err != nil {
+			log.Fatal(err)
 		}
-		return true
-	}, nil)
+		wd, _ := os.Getwd()
+		if err := ioutil.WriteFile(path.Join(wd, "build", path.Base(fname)), buf.Bytes(), 0666); err != nil {
+			log.Fatal(err)
+		}
+	}
 	for path, name := range pathToName {
 		wrtr = wrtr.AddStatements(
 			generator.NewRawStatementf("import %s %s", name, strconv.Quote(path)),
@@ -271,15 +340,36 @@ func main() {
 	for _, v := range funcDecls {
 		wrtr = wrtr.AddStatements(generator.NewRawStatement(v))
 	}
-	if err := format.Node(os.Stdout, token.NewFileSet(), n); err != nil {
-		log.Fatal(err)
-	}
-	wrtr = wrtr.Gofmt("-s").Goimports()
+	wrtr = wrtr.AddStatements(
+		generator.NewRawStatement(`
+		type _isuprofProfiler struct {
+			funcName string
+			startedAt time.Time
+			params, results []interface{}
+		}
+		
+		func _isuprofStartProfiling(name string, params ...interface{}) *_isuprofProfiler {
+			return &_isuprofProfiler{
+				funcName: name,
+				startedAt: time.Now(),
+				params: params,
+			}
+		}
+		
+		func (p _isuprofProfiler) stopProfiling(results ...interface{}) {
+			elapsed := time.Now().Sub(p.startedAt)
+			log.Printf("{\"elapsed\": %d, \"name\": \"%s\"}", elapsed, p.funcName)
+		}`),
+	)
+	wrtr = wrtr.Goimports().Gofmt("-s")
 	generated, err := wrtr.Generate(0)
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println(generated)
+	wd, _ := os.Getwd()
+	if err := ioutil.WriteFile(path.Join(wd, "build", "isuprof_generated.go"), []byte(generated), 0666); err != nil {
+		log.Fatal("failed to write generated.go:", err)
+	}
 }
 
 var src = `
@@ -351,10 +441,3 @@ func main() {
 	func() (*web.Mux, *Root) { return nil, nil }()
 }
 `
-/*
-func _isuprof_wrapper_x(a func(bool, bool) int, p1 bool, p2 bool) (r1 int) {
-	p := _isuprof_start_profiling(runtime.FuncForPC(reflect.ValueOf(a).Pointer()).Name(), p1, p2)
-	r1 = a(p1, p2)
-	p.finishProfiling(r1)
-}
-*/
