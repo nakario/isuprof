@@ -12,7 +12,7 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
-	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -247,7 +247,18 @@ func (h Hasher) Hash(t types.Type) uint32 {
 }
 
 func main() {
-	dir := "/Users/nakao/workspace/isucon9q/isucon9q"
+	if len(os.Args) != 2 {
+		exe, err := os.Executable()
+		if err != nil {
+			log.Fatal("failed to get executable name:", err)
+		}
+		fmt.Println("Usage:", exe, "path/to/dir")
+		return
+	}
+	dir, err := filepath.Abs(os.Args[1])
+	if err != nil {
+		log.Fatal("failed to get absolute path of", os.Args[0], ":", err)
+	}
 
 	fset := token.NewFileSet()
 	pkgs, err := parser.ParseDir(fset, dir, nil, parser.Mode(0))
@@ -328,7 +339,7 @@ func main() {
 			log.Fatal(err)
 		}
 		wd, _ := os.Getwd()
-		if err := ioutil.WriteFile(path.Join(wd, "build", path.Base(fname)), buf.Bytes(), 0666); err != nil {
+		if err := ioutil.WriteFile(filepath.Join(wd, "build", filepath.Base(fname)), buf.Bytes(), 0666); err != nil {
 			log.Fatal(err)
 		}
 	}
@@ -367,7 +378,7 @@ func main() {
 		log.Fatal(err)
 	}
 	wd, _ := os.Getwd()
-	if err := ioutil.WriteFile(path.Join(wd, "build", "isuprof_generated.go"), []byte(generated), 0666); err != nil {
+	if err := ioutil.WriteFile(filepath.Join(wd, "build", "isuprof_generated.go"), []byte(generated), 0666); err != nil {
 		log.Fatal("failed to write generated.go:", err)
 	}
 }
